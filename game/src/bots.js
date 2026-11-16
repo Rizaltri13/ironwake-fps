@@ -152,6 +152,8 @@ export function createBots(scene, world, mover, fx) {
     bot.goal = point.clone();
     bot.state = 'advance';
     bot.thenState = then;
+    bot.anchor = bot.body.position.clone();
+    bot.progressAt = 0;
   }
 
   // ---- round setup -------------------------------------------------------------
@@ -192,11 +194,12 @@ export function createBots(scene, world, mover, fx) {
     const spotsA = holdSpots('A');
     const spotsB = holdSpots('B');
     guards.forEach((bot, i) => {
-      if (i < 2) { bot.holdSpot = spotsA[i]; sendTo(bot, spotsA[i], 'hold'); }
-      else if (i < 4) { bot.holdSpot = spotsB[i - 2]; sendTo(bot, spotsB[i - 2], 'hold'); }
-      else { bot.holdSpot = new THREE.Vector3(0, 0, -6); sendTo(bot, bot.holdSpot, 'hold'); }
+      if (i < 2) { bot.holdSpot = spotsA[i]; bot.holdSite = 'A'; sendTo(bot, spotsA[i], 'hold'); }
+      else if (i < 4) { bot.holdSpot = spotsB[i - 2]; bot.holdSite = 'B'; sendTo(bot, spotsB[i - 2], 'hold'); }
+      else { bot.holdSpot = new THREE.Vector3(0, 0, -6); bot.holdSite = null; sendTo(bot, bot.holdSpot, 'hold'); }
       bot.planDelay = 0;
     });
+    intel = { site: null, t: -99 };
   }
 
   function setPlanted(siteKey, position) {
@@ -255,6 +258,13 @@ export function createBots(scene, world, mover, fx) {
 
   // ---- perception & combat -------------------------------------------------------
   const tmpDir = new THREE.Vector3();
+  // Squad intel: the last site a Sentinel saw a Striker near. Holders on the other
+  // site rotate off it while the intel is fresh, so a push meets a defence.
+  let intel = { site: null, t: -99 };
+
+  function nearerSiteKey(pos) {
+    return world.sites.A.center.distanceTo(pos) < world.sites.B.center.distanceTo(pos) ? 'A' : 'B';
+  }
 
   function perceive(bot, time) {
     const eye = bot.eyePos();
@@ -275,18 +285,19 @@ export function createBots(scene, world, mover, fx) {
     if (bestTarget) {
       if (bot.target !== bestTarget) { bot.target = bestTarget; bot.reactAt = time + (0.34 + Math.random() * 0.26) / bot.skill; }
       bot.seen.set(bestTarget.id, time);
+      if (bot.team === 'guard' && bestTarget.team === 'strike') intel = { site: nearerSiteKey(bestTarget.body.position), t: time };
     } else if (bot.target && time - (bot.seen.get(bot.target.id) ?? -9) > 1.6) {
       bot.target = null;
     }
   }
 
   function hitChance(bot, foe, dist) {
-    let p = 0.46 - dist * 0.0062;
+    let p = 0.43 - dist * 0.0058;
     p *= bot.skill;
     const speed = foe.body ? Math.hypot(foe.body.velocity.x, foe.body.velocity.z) : foe.groundSpeed();
     if (speed > 2.5) p *= 0.68;
     if (foe.body?.crouching || foe.crouching) p *= 0.85;
-    return Math.max(0.07, Math.min(0.5, p));
+    return Math.max(0.07, Math.min(0.46, p));
   }
 
   function botShoot(bot, time) {
@@ -374,14 +385,31 @@ export function createBots(scene, world, mover, fx) {
       const d = Math.hypot(moveTarget.x - bot.body.position.x, moveTarget.z - bot.body.position.z);
       if (d < 0.8) {
         bot.path.shift();
+        bot.anchor = bot.body.position.clone();
+        bot.progressAt = time;
         if (!bot.path.length) arrive(bot);
+      } else {
+        // Stuck recovery: if the body has not made 0.6 m of progress toward the
+        // route in 2.2 s (a prop on the line, a teammate in the doorway), skip
+        // this waypoint and walk at the next one instead of pushing forever.
+        if (!bot.anchor) { bot.anchor = bot.body.position.clone(); bot.progressAt = time; }
+        if (bot.body.position.distanceTo(bot.anchor) > 0.6) {
+          bot.anchor = bot.body.position.clone();
+          bot.progressAt = time;
+        } else if (time - bot.progressAt > 2.2) {
+          bot.path.shift();
+          bot.anchor = bot.body.position.clone();
+          bot.progressAt = time;
+          if (!bot.path.length) arrive(bot);
+        }
       }
     } else if (bot.state === 'push') {
-      // In the site: the carrier plants (only when the player is not the striker who
-      // must do it); others take angles.
+      // In the site: the first striker through the door plants (only when the player
+      // is not the striker who must do it); the others take angles.
       const site = world.sites[attackSite];
       const distSite = Math.hypot(site.center.x - bot.body.position.x, site.center.z - bot.body.position.z);
-      if (fx.playerTeam() !== 'strike' && bot.index === 0 && distSite < site.radius && !planted) {
+      const teammatePlanting = bots.some((b) => b !== bot && b.team === 'strike' && b.alive && b.channel?.type === 'plant');
+      if (fx.playerTeam() !== 'strike' && distSite < site.radius && !planted && !teammatePlanting) {
         bot.channel = { type: 'plant', t: 0, need: PLANT_TIME };
         crouch = true;
       } else {
@@ -396,6 +424,18 @@ export function createBots(scene, world, mover, fx) {
       } else {
         moveTarget = planted.position; // the site yards are open; walk straight in
       }
+    }
+
+    // Rotation: a Sentinel holding the quiet site while fresh intel puts the push on
+    // the other one leaves his angle and crosses over (half of them, so the quiet
+    // site is never fully naked).
+    if (!moveTarget && bot.state === 'hold' && bot.team === 'guard' && !planted
+      && intel.site && bot.holdSite && intel.site !== bot.holdSite
+      && time - intel.t < 25 && bot.index % 2 === 0) {
+      const spots = holdSpots(intel.site);
+      bot.holdSpot = spots[bot.index % spots.length];
+      bot.holdSite = intel.site;
+      sendTo(bot, bot.holdSpot, 'hold');
     }
 
     if (moveTarget) {
